@@ -24,3 +24,7 @@ target
 # Added by cargo
 
 /target
+
+# Runtime config — contains secrets (tokens/oauth). Never commit.
+config.json
+.env

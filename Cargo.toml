@@ -1,15 +1,18 @@
+[workspace]
+
 [package]
-name = "test_input_module"
+name = "cockatiel-stress-test"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1.0", features = ["full"] }
-tokio-tungstenite = "0.21"
+tokio = { version = "1.38", features = ["full"] }
+tokio-tungstenite = "0.24"
 futures-util = "0.3"
-prost = "0.12"
+prost = "0.14"
 serde = { version = "1.0", features = ["derive"] }
-uuid = { version = "1.0", features = ["v7", "serde"] }
+serde_json = "1.0"
+uuid = { version = "1.0", features = ["v7", "v4"] }
 
 [build-dependencies]
-prost-build = "0.12"
+prost-build = "0.13"
