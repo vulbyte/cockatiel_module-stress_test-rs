@@ -5,9 +5,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessage};
 
-pub mod proto {
-    include!(concat!(env!("OUT_DIR"), "/cockatiel_protobuf.v1.rs"));
-}
+pub use cockatiel_proto::proto;
 
 use proto::container::Payload;
 use proto::*;
