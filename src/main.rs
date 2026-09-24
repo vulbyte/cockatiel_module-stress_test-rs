@@ -10,6 +10,10 @@ pub use cockatiel_proto::proto;
 use proto::container::Payload;
 use proto::*;
 
+mod config;
+
+use config::Config;
+
 /// Engine address, overridable via --ip/--port (the benchmark points modules at
 /// a fake engine on a random port).
 static ENGINE_URL: OnceLock<String> = OnceLock::new();
@@ -152,7 +156,12 @@ fn dummy_chat_message() -> ChatMessage {
 // should cause the engine to sever the connection immediately when
 // sent without auth.
 
-async fn test_unauthed_message_type(results: &mut TestResults, name: &str, payload: Payload) {
+async fn test_unauthed_message_type(
+    results: &mut TestResults,
+    config: &Config,
+    name: &str,
+    payload: Payload,
+) {
     let test_id = uuid::Uuid::now_v7().to_string();
     let mut ws = match connect_ws().await {
         Ok(ws) => ws,
@@ -169,7 +178,7 @@ async fn test_unauthed_message_type(results: &mut TestResults, name: &str, paylo
         return;
     }
 
-    let severed = wait_for_sever(&mut ws, 2000).await;
+    let severed = wait_for_sever(&mut ws, config.sever_wait_ms).await;
     if severed {
         results.pass(name);
     } else {
@@ -179,7 +188,7 @@ async fn test_unauthed_message_type(results: &mut TestResults, name: &str, paylo
 
 // ── Test: Auth flow ──────────────────────────────────────────────────
 
-async fn test_auth_invalid_pin(results: &mut TestResults) {
+async fn test_auth_invalid_pin(results: &mut TestResults, config: &Config) {
     let test_id = uuid::Uuid::now_v7().to_string();
     let mut ws = match connect_ws().await {
         Ok(ws) => ws,
@@ -195,7 +204,7 @@ async fn test_auth_invalid_pin(results: &mut TestResults) {
         return;
     }
 
-    match receive_container(&mut ws, 2000).await {
+    match receive_container(&mut ws, config.invalid_pin_reply_ms).await {
         Ok(container) => match container.payload {
             Some(Payload::ConnectionRequestReturn(ret)) => {
                 if ret.new_port == 0 {
@@ -228,7 +237,7 @@ async fn test_auth_invalid_pin(results: &mut TestResults) {
 /// Authenticate with a valid PIN and return the issued `(auth_token, instance_uuid7)`.
 /// The token is cryptographically bound to the instance uuid (JWT `sub` claim), so a
 /// later reconnect must present the SAME uuid or `verify_token` fails.
-async fn test_auth_valid_pin(results: &mut TestResults) -> Option<(String, String)> {
+async fn test_auth_valid_pin(results: &mut TestResults, config: &Config) -> Option<(String, String)> {
     let test_id = uuid::Uuid::now_v7().to_string();
     let mut ws = match connect_ws().await {
         Ok(ws) => ws,
@@ -247,7 +256,7 @@ async fn test_auth_valid_pin(results: &mut TestResults) -> Option<(String, Strin
     // The engine will prompt for auth on the terminal. For automated testing,
     // pre-register this module in modules.json with auto_auth=true.
     // If not registered, the prompt will block and we'll timeout here.
-    match receive_container(&mut ws, 15000).await {
+    match receive_container(&mut ws, config.valid_pin_reply_ms).await {
         Ok(container) => match container.payload {
             Some(Payload::ConnectionRequestReturn(ret)) => {
                 if ret.new_port == 0 && !container.auth_token.is_empty() {
@@ -289,6 +298,7 @@ async fn test_auth_valid_pin(results: &mut TestResults) -> Option<(String, Strin
 /// the authenticated session for the authed_* tests.
 async fn test_reconnect_with_token(
     results: &mut TestResults,
+    config: &Config,
     auth_token: &str,
     instance_uuid: &str,
 ) -> Option<String> {
@@ -312,7 +322,7 @@ async fn test_reconnect_with_token(
     // response on reconnect, so a timeout (or an unexpected message) means the
     // session is authenticated and alive; a close/stream-end means it was
     // severed.
-    let result = tokio::time::timeout(Duration::from_millis(1500), ws.next()).await;
+    let result = tokio::time::timeout(Duration::from_millis(config.keepalive_probe_ms), ws.next()).await;
     match result {
         Ok(None) => {
             results.fail("reconnect_with_token", "Connection closed (reconnect rejected)");
@@ -334,7 +344,7 @@ async fn test_reconnect_with_token(
     }
 }
 
-async fn test_reconnect_invalid_token(results: &mut TestResults) {
+async fn test_reconnect_invalid_token(results: &mut TestResults, config: &Config) {
     let test_id = uuid::Uuid::now_v7().to_string();
     let mut ws = match connect_ws().await {
         Ok(ws) => ws,
@@ -365,7 +375,7 @@ async fn test_reconnect_invalid_token(results: &mut TestResults) {
         return;
     }
 
-    let severed = wait_for_sever(&mut ws, 2000).await;
+    let severed = wait_for_sever(&mut ws, config.sever_wait_ms).await;
     if severed {
         results.pass("reconnect_invalid_token");
     } else {
@@ -382,6 +392,7 @@ async fn test_reconnect_invalid_token(results: &mut TestResults) {
 
 async fn test_authed_send(
     results: &mut TestResults,
+    config: &Config,
     name: &str,
     auth_token: &str,
     uuid: &str,
@@ -407,10 +418,10 @@ async fn test_authed_send(
     }
 
     // Wait for auth to be processed
-    sleep(Duration::from_millis(300)).await;
+    sleep(Duration::from_millis(config.post_reconnect_settle_ms)).await;
 
     // Drain any messages the engine may have sent
-    let result = tokio::time::timeout(Duration::from_millis(100), ws.next()).await;
+    let result = tokio::time::timeout(Duration::from_millis(config.pre_test_drain_ms), ws.next()).await;
     if let Ok(Some(Ok(WsMessage::Close(_)))) = result {
         results.fail(name, "Connection severed during drain");
         return;
@@ -424,7 +435,7 @@ async fn test_authed_send(
     }
 
     // Check connection is still alive
-    let result = tokio::time::timeout(Duration::from_millis(500), ws.next()).await;
+    let result = tokio::time::timeout(Duration::from_millis(config.post_send_alive_check_ms), ws.next()).await;
     match result {
         Ok(Some(Ok(WsMessage::Close(_)))) => {
             results.fail(name, "Connection severed after send (auth may have failed)");
@@ -443,6 +454,8 @@ async fn test_authed_send(
 
 #[tokio::main]
 async fn main() {
+    let config = Config::load_or_default();
+
     // Parse --ip / --port / --pin overrides (the benchmark points this at a
     // fake engine on a random port).
     let args: Vec<String> = std::env::args().collect();
@@ -514,6 +527,7 @@ async fn main() {
 
     test_unauthed_message_type(
         &mut results,
+        &config,
         "unauth_ConnectionRequestReturn",
         Payload::ConnectionRequestReturn(ConnectionRequestReturn {
             new_port: 9999,
@@ -524,6 +538,7 @@ async fn main() {
 
     test_unauthed_message_type(
         &mut results,
+        &config,
         "unauth_AuthNew",
         Payload::AuthNew(AuthNew {
             new_auth: "new-token".into(),
@@ -533,6 +548,7 @@ async fn main() {
 
     test_unauthed_message_type(
         &mut results,
+        &config,
         "unauth_AuthVerify",
         Payload::AuthVerify(AuthVerify {
             cur_auth: "some-token".into(),
@@ -542,6 +558,7 @@ async fn main() {
 
     test_unauthed_message_type(
         &mut results,
+        &config,
         "unauth_Command",
         Payload::CommandPayload(Command {
             command_name: "test_cmd".into(),
@@ -554,6 +571,7 @@ async fn main() {
 
     test_unauthed_message_type(
         &mut results,
+        &config,
         "unauth_Commands",
         Payload::CommandsPayload(Commands { commands: vec![] }),
     )
@@ -561,6 +579,7 @@ async fn main() {
 
     test_unauthed_message_type(
         &mut results,
+        &config,
         "unauth_UserData",
         Payload::UserData(UserData {
             uuid: "test-user".into(),
@@ -579,6 +598,7 @@ async fn main() {
 
     test_unauthed_message_type(
         &mut results,
+        &config,
         "unauth_Log",
         Payload::Log(Log {
             log: "test log".into(),
@@ -589,6 +609,7 @@ async fn main() {
 
     test_unauthed_message_type(
         &mut results,
+        &config,
         "unauth_Err",
         Payload::Err(Err {
             log: "test error".into(),
@@ -600,6 +621,7 @@ async fn main() {
 
     test_unauthed_message_type(
         &mut results,
+        &config,
         "unauth_Shutdown",
         Payload::Shutdown(Shutdown {
             reason: "test shutdown".into(),
@@ -609,6 +631,7 @@ async fn main() {
 
     test_unauthed_message_type(
         &mut results,
+        &config,
         "unauth_SendToPlatforms",
         Payload::SendToPlatforms(SendToPlatforms {
             msg: "test".into(),
@@ -625,6 +648,7 @@ async fn main() {
 
     test_unauthed_message_type(
         &mut results,
+        &config,
         "unauth_TimelineEvent",
         Payload::TimelineEvent(TimelineEvent {
             timeline_id_uuid7: "test".into(),
@@ -645,6 +669,7 @@ async fn main() {
 
     test_unauthed_message_type(
         &mut results,
+        &config,
         "unauth_MessagePreProcess",
         Payload::MessagePreProcess(MessagePreProcess {
             message_uuid7: String::new(),
@@ -657,6 +682,7 @@ async fn main() {
 
     test_unauthed_message_type(
         &mut results,
+        &config,
         "unauth_MessageInProcess",
         Payload::MessageInProcess(MessageInProcess {
             message_uuid7: String::new(),
@@ -671,6 +697,7 @@ async fn main() {
 
     test_unauthed_message_type(
         &mut results,
+        &config,
         "unauth_MessagePostProcess",
         Payload::MessagePostProcess(MessagePostProcess {
             message_uuid7: String::new(),
@@ -685,9 +712,9 @@ async fn main() {
     // ── Phase 2: Auth flow ────────────────────────────────────────────
     println!("\n--- Phase 2: Auth flow ---\n");
 
-    test_auth_invalid_pin(&mut results).await;
+    test_auth_invalid_pin(&mut results, &config).await;
 
-    let auth = test_auth_valid_pin(&mut results).await;
+    let auth = test_auth_valid_pin(&mut results, &config).await;
     let (auth_token, auth_instance_uuid) = match auth {
         Some(v) => v,
         None => {
@@ -736,8 +763,8 @@ async fn main() {
     // The reconnect MUST reuse the uuid the token was minted for: the token's
     // JWT `sub` is bound to it, so a fresh uuid would always be severed.
     let assigned_uuid =
-        test_reconnect_with_token(&mut results, &auth_token, &auth_instance_uuid).await;
-    test_reconnect_invalid_token(&mut results).await;
+        test_reconnect_with_token(&mut results, &config, &auth_token, &auth_instance_uuid).await;
+    test_reconnect_invalid_token(&mut results, &config).await;
 
     let assigned_uuid = match assigned_uuid {
         Some(u) => u,
@@ -759,6 +786,7 @@ async fn main() {
 
     test_authed_send(
         &mut results,
+        &config,
         "authed_Log",
         &auth_token,
         &assigned_uuid,
@@ -771,6 +799,7 @@ async fn main() {
 
     test_authed_send(
         &mut results,
+        &config,
         "authed_Err",
         &auth_token,
         &assigned_uuid,
@@ -784,6 +813,7 @@ async fn main() {
 
     test_authed_send(
         &mut results,
+        &config,
         "authed_TimelineEvent",
         &auth_token,
         &assigned_uuid,
@@ -806,6 +836,7 @@ async fn main() {
 
     test_authed_send(
         &mut results,
+        &config,
         "authed_MessagePreProcess",
         &auth_token,
         &assigned_uuid,
@@ -820,6 +851,7 @@ async fn main() {
 
     test_authed_send(
         &mut results,
+        &config,
         "authed_MessageInProcess",
         &auth_token,
         &assigned_uuid,
@@ -836,6 +868,7 @@ async fn main() {
 
     test_authed_send(
         &mut results,
+        &config,
         "authed_MessagePostProcess",
         &auth_token,
         &assigned_uuid,
@@ -851,6 +884,7 @@ async fn main() {
 
     test_authed_send(
         &mut results,
+        &config,
         "authed_Commands",
         &auth_token,
         &assigned_uuid,
@@ -874,6 +908,7 @@ async fn main() {
 
     test_authed_send(
         &mut results,
+        &config,
         "authed_SendToPlatforms",
         &auth_token,
         &assigned_uuid,
@@ -895,6 +930,7 @@ async fn main() {
 
     test_authed_send(
         &mut results,
+        &config,
         "authed_Shutdown",
         &auth_token,
         &assigned_uuid,
@@ -906,6 +942,7 @@ async fn main() {
 
     test_authed_send(
         &mut results,
+        &config,
         "authed_AuthNew",
         &auth_token,
         &assigned_uuid,
@@ -917,6 +954,7 @@ async fn main() {
 
     test_authed_send(
         &mut results,
+        &config,
         "authed_AuthVerify",
         &auth_token,
         &assigned_uuid,
@@ -928,6 +966,7 @@ async fn main() {
 
     test_authed_send(
         &mut results,
+        &config,
         "authed_ConnectionRequest",
         &auth_token,
         &assigned_uuid,
@@ -942,6 +981,7 @@ async fn main() {
 
     test_authed_send(
         &mut results,
+        &config,
         "authed_UserData",
         &auth_token,
         &assigned_uuid,
