@@ -75,7 +75,7 @@ async fn connect_ws() -> Result<WsStream, String> {
 async fn send_container(ws: &mut WsStream, container: Container) -> Result<(), String> {
     let mut buf = Vec::new();
     container.encode(&mut buf).map_err(|e| format!("Encode error: {}", e))?;
-    ws.send(WsMessage::Binary(buf.into()))
+    ws.send(WsMessage::Binary(buf))
         .await
         .map_err(|e| format!("Send error: {}", e))
 }
@@ -225,7 +225,10 @@ async fn test_auth_invalid_pin(results: &mut TestResults) {
     }
 }
 
-async fn test_auth_valid_pin(results: &mut TestResults) -> Option<String> {
+/// Authenticate with a valid PIN and return the issued `(auth_token, instance_uuid7)`.
+/// The token is cryptographically bound to the instance uuid (JWT `sub` claim), so a
+/// later reconnect must present the SAME uuid or `verify_token` fails.
+async fn test_auth_valid_pin(results: &mut TestResults) -> Option<(String, String)> {
     let test_id = uuid::Uuid::now_v7().to_string();
     let mut ws = match connect_ws().await {
         Ok(ws) => ws,
@@ -249,7 +252,7 @@ async fn test_auth_valid_pin(results: &mut TestResults) -> Option<String> {
             Some(Payload::ConnectionRequestReturn(ret)) => {
                 if ret.new_port == 0 && !container.auth_token.is_empty() {
                     results.pass("auth_valid_pin");
-                    Some(container.auth_token)
+                    Some((container.auth_token, test_id))
                 } else {
                     results.fail(
                         "auth_valid_pin",
@@ -277,11 +280,18 @@ async fn test_auth_valid_pin(results: &mut TestResults) -> Option<String> {
     }
 }
 
+/// Reconnect an authenticated session by presenting the minted token with the
+/// SAME instance uuid it was issued for. The engine's `verify_token` binds the
+/// JWT `sub` claim to the uuid, so a fresh `Uuid::now_v7()` here would always
+/// be severed. The engine also requires the FIRST message to be a
+/// ConnectionRequest (carrying the token) — a bare Log is rejected before any
+/// token check. Returns the instance uuid on success so the caller can reuse
+/// the authenticated session for the authed_* tests.
 async fn test_reconnect_with_token(
     results: &mut TestResults,
     auth_token: &str,
+    instance_uuid: &str,
 ) -> Option<String> {
-    let test_id = uuid::Uuid::now_v7().to_string();
     let mut ws = match connect_ws().await {
         Ok(ws) => ws,
         Err(e) => {
@@ -290,28 +300,23 @@ async fn test_reconnect_with_token(
         }
     };
 
-    // Send any message type with auth token — Log is simplest
-    let container = make_container(
-        "stress-test",
-        &test_id,
-        auth_token,
-        Payload::Log(Log {
-            log: "stress test reconnection".into(),
-            blob: vec![],
-        }),
-    );
+    let mut req = make_connection_request(cli_pin(), instance_uuid);
+    req.auth_token = auth_token.to_string();
 
-    if let Err(e) = send_container(&mut ws, container).await {
+    if let Err(e) = send_container(&mut ws, req).await {
         results.fail("reconnect_with_token", &format!("Send failed: {}", e));
         return None;
     }
 
-    // If authenticated, connection stays open. Check we weren't severed immediately.
+    // A successful reconnect keeps the connection open. The engine sends no
+    // response on reconnect, so a timeout (or an unexpected message) means the
+    // session is authenticated and alive; a close/stream-end means it was
+    // severed.
     let result = tokio::time::timeout(Duration::from_millis(1500), ws.next()).await;
     match result {
         Ok(None) => {
-            results.pass("reconnect_with_token");
-            Some(test_id)
+            results.fail("reconnect_with_token", "Connection closed (reconnect rejected)");
+            None
         }
         Ok(Some(Ok(WsMessage::Close(_)))) => {
             results.fail("reconnect_with_token", "Connection was severed (invalid auth?)");
@@ -322,9 +327,9 @@ async fn test_reconnect_with_token(
             None
         }
         _ => {
-            // Timeout or other message — connection still alive
+            // Timeout or unexpected message — connection still alive.
             results.pass("reconnect_with_token");
-            Some(test_id)
+            Some(instance_uuid.to_string())
         }
     }
 }
@@ -390,16 +395,12 @@ async fn test_authed_send(
         }
     };
 
-    // First, reconnect with auth token via a Log message
-    let reconnect = make_container(
-        "stress-test",
-        uuid,
-        auth_token,
-        Payload::Log(Log {
-            log: "authed send test".into(),
-            blob: vec![],
-        }),
-    );
+    // First, re-establish the authenticated session. The engine requires the
+    // FIRST message to be a ConnectionRequest carrying the minted token for the
+    // instance uuid it was issued to (a bare Log is rejected before any token
+    // check, and a fresh uuid would fail verify_token's `sub` binding).
+    let mut reconnect = make_connection_request(cli_pin(), uuid);
+    reconnect.auth_token = auth_token.to_string();
     if let Err(e) = send_container(&mut ws, reconnect).await {
         results.fail(name, &format!("Reconnect send failed: {}", e));
         return;
@@ -478,9 +479,21 @@ async fn main() {
     let _ = ENGINE_URL.set(format!("ws://{}:{}", ip, port));
     let _ = CLI_PIN.set(pin);
 
+    // ── Live-engine guard ─────────────────────────────────────────────
+    // Phase 3+ (authed/ingest) presents minted tokens and injects real messages
+    // into the engine's live pipeline (authed_MessagePreProcess ingests,
+    // authed_SendToPlatforms posts to platforms), which is only safe against the
+    // fake engine. Require an explicit opt-in --live-ok (or STRESS_TEST_LIVE_OK=1)
+    // before running any authed phase, regardless of target.
+    let live_ok = std::env::var("STRESS_TEST_LIVE_OK")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+        || args.iter().any(|a| a == "--live-ok");
+
     println!("\n{}", "=".repeat(60));
     println!("  COCKATIEL ENGINE STRESS TEST");
     println!("  Target: {}", engine_url());
+    println!("  Live-engine opt-in (--live-ok): {}", live_ok);
     println!("{}\n", "=".repeat(60));
 
     let mut results = TestResults::new();
@@ -488,6 +501,16 @@ async fn main() {
     // ── Phase 1: Unauthenticated message types ────────────────────────
     // All Container oneof variants (except ConnectionRequest) should sever.
     println!("\n--- Phase 1: Unauthenticated message types (expect sever) ---\n");
+
+    // Timeline pollution note: Phase 1 opens ~15 unauthenticated connections,
+    // each of which the REAL engine archives as a `module_reject` timeline
+    // event. The fake engine records none (it has no timeline DB). The live
+    // engine path is gated behind --live-ok; expect the pollution there.
+    if live_ok {
+        println!("\x1b[33mNote:\x1b[0m against a live engine each unauth connect below archives a");
+        println!("      `module_reject` timeline event (~15 total). That pollution is inherent");
+        println!("      to these negative tests; the fake engine records none of it.");
+    }
 
     test_unauthed_message_type(
         &mut results,
@@ -664,9 +687,9 @@ async fn main() {
 
     test_auth_invalid_pin(&mut results).await;
 
-    let auth_token = test_auth_valid_pin(&mut results).await;
-    let auth_token = match auth_token {
-        Some(t) => t,
+    let auth = test_auth_valid_pin(&mut results).await;
+    let (auth_token, auth_instance_uuid) = match auth {
+        Some(v) => v,
         None => {
             results.skip("reconnect_with_token", "No auth token from previous test");
             results.skip(
@@ -682,14 +705,50 @@ async fn main() {
     // ── Phase 3: Reconnection ─────────────────────────────────────────
     println!("\n--- Phase 3: Reconnection with token ---\n");
 
-    let assigned_uuid = test_reconnect_with_token(&mut results, &auth_token).await;
+    // Live-engine guard: Phase 3+ exercises authenticated sessions and Phase 4
+    // injects real payloads into the engine's live pipeline. Refuse to run any
+    // of it unless the operator opted in explicitly.
+    if !live_ok {
+        println!("\n\x1b[31m{}", "=".repeat(60));
+        println!("  REFUSING to run authed/ingest phases (Phase 3+).");
+        println!("  The authed phases inject real messages into the engine's live");
+        println!("  pipeline (authed_MessagePreProcess ingests, authed_SendToPlatforms");
+        println!("  posts to platforms) and are only safe against the fake engine.");
+        println!("  Re-run with --live-ok (or STRESS_TEST_LIVE_OK=1) to opt in.");
+        println!("  {}\x1b[0m", "=".repeat(60));
+        results.skip("phase3_reconnect_with_token", "live guard: --live-ok not set");
+        results.skip(
+            "phase3_reconnect_invalid_token",
+            "live guard: --live-ok not set",
+        );
+        results.skip("phase4_authed_send_tests", "live guard: --live-ok not set");
+        results.summary();
+        return;
+    }
+
+    println!("\x1b[33m{}", "=".repeat(60));
+    println!("  WARNING: --live-ok set — running authed/ingest phases against");
+    println!("  {}", engine_url());
+    println!("  These inject real messages into the engine's live pipeline and");
+    println!("  are ONLY safe against the fake engine. Proceed at your own risk.");
+    println!("  {}\x1b[0m", "=".repeat(60));
+
+    // The reconnect MUST reuse the uuid the token was minted for: the token's
+    // JWT `sub` is bound to it, so a fresh uuid would always be severed.
+    let assigned_uuid =
+        test_reconnect_with_token(&mut results, &auth_token, &auth_instance_uuid).await;
     test_reconnect_invalid_token(&mut results).await;
 
     let assigned_uuid = match assigned_uuid {
         Some(u) => u,
         None => {
-            results.skip("authed_send_tests", "No UUID from reconnect");
-            println!("\n--- Skipping authenticated message tests (no UUID) ---");
+            results.skip(
+                "authed_send_tests",
+                "Reconnect failed — no authenticated session established",
+            );
+            println!(
+                "\n\x1b[31m--- Skipping Phase 4 authenticated message tests: reconnect FAILED above ---\x1b[0m"
+            );
             results.summary();
             return;
         }
