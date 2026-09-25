@@ -8,7 +8,9 @@ edition = "2021"
 [dependencies]
 cockatiel-proto = { git = "https://github.com/vulbyte/cockatiel_proto", rev = "012845421731ccd8a9fc3e58ad1e89a4e4900fbe" }
 tokio = { version = "1.38", features = ["full"] }
-tokio-tungstenite = "0.24"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+rustls = "0.23"
+rustls-pemfile = "2"
 futures-util = "0.3"
 prost = "0.14"
 serde = { version = "1.0", features = ["derive"] }

@@ -69,10 +69,49 @@ impl TestResults {
 
 type WsStream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// Build a rustls client config that trusts exactly the engine's self-signed
+/// certificate (cert pinning). Any other chain is rejected.
+fn pinned_tls_config(cert_pem_path: &str) -> Result<rustls::ClientConfig, String> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let cert_bytes = std::fs::read(cert_pem_path)
+        .map_err(|e| format!("read TLS cert {}: {}", cert_pem_path, e))?;
+    let mut reader = std::io::BufReader::new(cert_bytes.as_slice());
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("parse TLS cert: {}", e))?;
+    let mut roots = rustls::RootCertStore::empty();
+    for c in certs {
+        roots
+            .add(c)
+            .map_err(|e| format!("add pinned cert: {}", e))?;
+    }
+    Ok(rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth())
+}
+
+/// WSS when COCKATIEL_TLS_CERT points at the engine's self-signed cert (pinned
+/// as the trust root); plain ws:// otherwise (the fake-engine path).
 async fn connect_ws() -> Result<WsStream, String> {
-    let (ws, _) = connect_async(engine_url())
-        .await
-        .map_err(|e| format!("Connection failed: {}", e))?;
+    let url = engine_url();
+    let (scheme, connector): (&str, Option<tokio_tungstenite::Connector>) =
+        match std::env::var("COCKATIEL_TLS_CERT") {
+            Ok(path) if !path.trim().is_empty() => {
+                let cfg = pinned_tls_config(&path)?;
+                ("wss", Some(tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(cfg))))
+            }
+            _ => ("ws", None),
+        };
+    let hostport = url
+        .strip_prefix("ws://")
+        .or_else(|| url.strip_prefix("wss://"))
+        .unwrap_or(url);
+    let url = format!("{}://{}", scheme, hostport);
+    let result = match &connector {
+        Some(c) => tokio_tungstenite::connect_async_tls_with_config(&url, None, false, Some(c.clone())).await,
+        None => connect_async(&url).await,
+    };
+    let (ws, _) = result.map_err(|e| format!("Connection failed: {}", e))?;
     Ok(ws)
 }
 
