@@ -186,6 +186,7 @@ fn dummy_chat_message() -> ChatMessage {
         user_uuid7: "00000000-0000-7000-0000-000000000001".into(),
         command: None,
         user_data: None,
+        channel_id: String::new(),
     }
 }
 
@@ -612,7 +613,7 @@ async fn main() {
         &mut results,
         &config,
         "unauth_Commands",
-        Payload::CommandsPayload(Commands { commands: vec![] }),
+        Payload::CommandsPayload(Commands { commands: vec![], alert_on_unknown_command: false }),
     )
     .await;
 
@@ -678,6 +679,7 @@ async fn main() {
             module_uuid7: "test".into(),
             pid: "".into(),
             platform: "all".into(),
+            channel_id: String::new(),
             actor_platform: "stress-test".into(),
             actor_handle: "stress-test".into(),
             actor_uuid7: "".into(),
@@ -928,6 +930,7 @@ async fn main() {
         &auth_token,
         &assigned_uuid,
         Payload::CommandsPayload(Commands {
+            alert_on_unknown_command: false,
             commands: vec![Command {
                 command_name: "test_cmd".into(),
                 command_flag: "!test".into(),
@@ -939,6 +942,7 @@ async fn main() {
                     min_val: 0.0,
                     max_val: 1.0,
                     options: vec![],
+                    value: String::new(),
                 }],
             }],
         }),
@@ -958,6 +962,7 @@ async fn main() {
             msg: "Hello from stress test!".into(),
             level: PlatformSendLevel::All as i32,
             module_uuid7: assigned_uuid.clone(),
+            channel_id: String::new(),
             pid: "".into(),
             platform: "all".into(),
             actor_platform: "stress-test".into(),
