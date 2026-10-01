@@ -7,7 +7,8 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessa
 
 pub use cockatiel_proto::proto;
 
-use proto::container::Payload;
+use proto::container_for_engine::Payload as EnginePayload;
+use proto::container_for_module::Payload as ModulePayload;
 use proto::*;
 
 mod config;
@@ -115,7 +116,7 @@ async fn connect_ws() -> Result<WsStream, String> {
     Ok(ws)
 }
 
-async fn send_container(ws: &mut WsStream, container: Container) -> Result<(), String> {
+async fn send_container(ws: &mut WsStream, container: ContainerForEngine) -> Result<(), String> {
     let mut buf = Vec::new();
     container.encode(&mut buf).map_err(|e| format!("Encode error: {}", e))?;
     ws.send(WsMessage::Binary(buf))
@@ -123,11 +124,11 @@ async fn send_container(ws: &mut WsStream, container: Container) -> Result<(), S
         .map_err(|e| format!("Send error: {}", e))
 }
 
-async fn receive_container(ws: &mut WsStream, timeout_ms: u64) -> Result<Container, String> {
+async fn receive_container(ws: &mut WsStream, timeout_ms: u64) -> Result<ContainerForModule, String> {
     let result = tokio::time::timeout(Duration::from_millis(timeout_ms), ws.next()).await;
     match result {
         Ok(Some(Ok(WsMessage::Binary(data)))) => {
-            Container::decode(data.as_ref()).map_err(|e| format!("Decode error: {}", e))
+            ContainerForModule::decode(data.as_ref()).map_err(|e| format!("Decode error: {}", e))
         }
         Ok(Some(Ok(WsMessage::Close(_)))) => Err("Connection closed by server".into()),
         Ok(Some(Ok(_))) => Err("Received non-binary message".into()),
@@ -154,9 +155,9 @@ async fn wait_for_sever(ws: &mut WsStream, timeout_ms: u64) -> bool {
     result.unwrap_or(false)
 }
 
-fn make_container(module_name: &str, uuid: &str, auth_token: &str, payload: Payload) -> Container {
-    Container {
-        version: 1,
+fn make_container(module_name: &str, uuid: &str, auth_token: &str, payload: EnginePayload) -> ContainerForEngine {
+    ContainerForEngine {
+        version: 2,
         auth_token: auth_token.to_string(),
         module_name: module_name.to_string(),
         module_instance_uuid7: uuid.to_string(),
@@ -164,12 +165,12 @@ fn make_container(module_name: &str, uuid: &str, auth_token: &str, payload: Payl
     }
 }
 
-fn make_connection_request(pin: i32, uuid: &str) -> Container {
+fn make_connection_request(pin: i32, uuid: &str) -> ContainerForEngine {
     make_container(
         "stress-test",
         uuid,
         "",
-        Payload::ConnectionRequest(ConnectionRequest {
+        EnginePayload::ConnectionRequest(ConnectionRequest {
             pin,
             process_position: ProcessPosition::Connection as i32,
             priority: 100,
@@ -200,7 +201,7 @@ async fn test_unauthed_message_type(
     results: &mut TestResults,
     config: &Config,
     name: &str,
-    payload: Payload,
+    payload: EnginePayload,
 ) {
     let test_id = uuid::Uuid::now_v7().to_string();
     let mut ws = match connect_ws().await {
@@ -246,7 +247,7 @@ async fn test_auth_invalid_pin(results: &mut TestResults, config: &Config) {
 
     match receive_container(&mut ws, config.invalid_pin_reply_ms).await {
         Ok(container) => match container.payload {
-            Some(Payload::ConnectionRequestReturn(ret)) => {
+            Some(ModulePayload::ConnectionRequestReturn(ret)) => {
                 if ret.new_port == 0 {
                     results.pass("auth_invalid_pin");
                 } else {
@@ -298,7 +299,7 @@ async fn test_auth_valid_pin(results: &mut TestResults, config: &Config) -> Opti
     // If not registered, the prompt will block and we'll timeout here.
     match receive_container(&mut ws, config.valid_pin_reply_ms).await {
         Ok(container) => match container.payload {
-            Some(Payload::ConnectionRequestReturn(ret)) => {
+            Some(ModulePayload::ConnectionRequestReturn(ret)) => {
                 if ret.new_port == 0 && !container.auth_token.is_empty() {
                     results.pass("auth_valid_pin");
                     Some((container.auth_token, test_id))
@@ -401,7 +402,7 @@ async fn test_reconnect_invalid_token(results: &mut TestResults, config: &Config
         "stress-test",
         &test_id,
         "definitely-not-a-valid-token",
-        Payload::Log(Log {
+        EnginePayload::Log(Log {
             log: "should be severed".into(),
             blob: vec![],
         }),
@@ -436,7 +437,7 @@ async fn test_authed_send(
     name: &str,
     auth_token: &str,
     uuid: &str,
-    payload: Payload,
+    payload: EnginePayload,
 ) {
     let mut ws = match connect_ws().await {
         Ok(ws) => ws,
@@ -555,42 +556,21 @@ async fn main() {
     // All Container oneof variants (except ConnectionRequest) should sever.
     println!("\n--- Phase 1: Unauthenticated message types (expect sever) ---\n");
 
-    // Timeline pollution note: Phase 1 opens ~15 unauthenticated connections,
+    // Timeline pollution note: Phase 1 opens ~9 unauthenticated connections,
     // each of which the REAL engine archives as a `module_reject` timeline
     // event. The fake engine records none (it has no timeline DB). The live
     // engine path is gated behind --live-ok; expect the pollution there.
     if live_ok {
         println!("\x1b[33mNote:\x1b[0m against a live engine each unauth connect below archives a");
-        println!("      `module_reject` timeline event (~15 total). That pollution is inherent");
+        println!("      `module_reject` timeline event (~9 total). That pollution is inherent");
         println!("      to these negative tests; the fake engine records none of it.");
     }
 
     test_unauthed_message_type(
         &mut results,
         &config,
-        "unauth_ConnectionRequestReturn",
-        Payload::ConnectionRequestReturn(ConnectionRequestReturn {
-            new_port: 9999,
-            module_instance_uuid7: "test".into(),
-        }),
-    )
-    .await;
-
-    test_unauthed_message_type(
-        &mut results,
-        &config,
-        "unauth_AuthNew",
-        Payload::AuthNew(AuthNew {
-            new_auth: "new-token".into(),
-        }),
-    )
-    .await;
-
-    test_unauthed_message_type(
-        &mut results,
-        &config,
         "unauth_AuthVerify",
-        Payload::AuthVerify(AuthVerify {
+        EnginePayload::AuthVerify(AuthVerify {
             cur_auth: "some-token".into(),
         }),
     )
@@ -600,7 +580,7 @@ async fn main() {
         &mut results,
         &config,
         "unauth_Command",
-        Payload::CommandPayload(Command {
+        EnginePayload::Command(Command {
             command_name: "test_cmd".into(),
             command_flag: "".into(),
             command_description: "test".into(),
@@ -613,26 +593,7 @@ async fn main() {
         &mut results,
         &config,
         "unauth_Commands",
-        Payload::CommandsPayload(Commands { commands: vec![], alert_on_unknown_command: false }),
-    )
-    .await;
-
-    test_unauthed_message_type(
-        &mut results,
-        &config,
-        "unauth_UserData",
-        Payload::UserData(UserData {
-            uuid: "test-user".into(),
-            username: "tester".into(),
-            is_sponsor: false,
-            is_moderator: false,
-            is_admin: false,
-            is_owner: false,
-            bans: vec![],
-            commendations: vec![],
-            styling: None,
-            platform_ids: Default::default(),
-        }),
+        EnginePayload::Commands(Commands { commands: vec![], alert_on_unknown_command: false }),
     )
     .await;
 
@@ -640,7 +601,7 @@ async fn main() {
         &mut results,
         &config,
         "unauth_Log",
-        Payload::Log(Log {
+        EnginePayload::Log(Log {
             log: "test log".into(),
             blob: vec![],
         }),
@@ -651,7 +612,7 @@ async fn main() {
         &mut results,
         &config,
         "unauth_Err",
-        Payload::Err(Err {
+        EnginePayload::Err(Err {
             log: "test error".into(),
             blob: vec![],
             trace: "stack trace".into(),
@@ -662,18 +623,8 @@ async fn main() {
     test_unauthed_message_type(
         &mut results,
         &config,
-        "unauth_Shutdown",
-        Payload::Shutdown(Shutdown {
-            reason: "test shutdown".into(),
-        }),
-    )
-    .await;
-
-    test_unauthed_message_type(
-        &mut results,
-        &config,
         "unauth_SendToPlatforms",
-        Payload::SendToPlatforms(SendToPlatforms {
+        EnginePayload::SendToPlatforms(SendToPlatforms {
             msg: "test".into(),
             level: PlatformSendLevel::All as i32,
             module_uuid7: "test".into(),
@@ -690,29 +641,8 @@ async fn main() {
     test_unauthed_message_type(
         &mut results,
         &config,
-        "unauth_TimelineEvent",
-        Payload::TimelineEvent(TimelineEvent {
-            timeline_id_uuid7: "test".into(),
-            event_type: EventCategory::Log as i32,
-            command_flag: "".into(),
-            data_blob: vec![],
-            error_message: "".into(),
-            raw_flags: "".into(),
-            message_origin: "test".into(),
-            stream_origin: "".into(),
-            raw_message: "".into(),
-            processed_message: "".into(),
-            user_uuid7: "".into(),
-            version: 1,
-        }),
-    )
-    .await;
-
-    test_unauthed_message_type(
-        &mut results,
-        &config,
         "unauth_MessagePreProcess",
-        Payload::MessagePreProcess(MessagePreProcess {
+        EnginePayload::MessagePreProcess(MessagePreProcess {
             message_uuid7: String::new(),
             raw_message: Some(dummy_chat_message()),
             audio: vec![],
@@ -725,7 +655,7 @@ async fn main() {
         &mut results,
         &config,
         "unauth_MessageInProcess",
-        Payload::MessageInProcess(MessageInProcess {
+        EnginePayload::MessageInProcess(MessageInProcess {
             message_uuid7: String::new(),
             raw_message: Some(dummy_chat_message()),
             processed_message: "processed".into(),
@@ -740,7 +670,7 @@ async fn main() {
         &mut results,
         &config,
         "unauth_MessagePostProcess",
-        Payload::MessagePostProcess(MessagePostProcess {
+        EnginePayload::MessagePostProcess(MessagePostProcess {
             message_uuid7: String::new(),
             raw_message: Some(dummy_chat_message()),
             processed_message: "processed".into(),
@@ -831,7 +761,7 @@ async fn main() {
         "authed_Log",
         &auth_token,
         &assigned_uuid,
-        Payload::Log(Log {
+        EnginePayload::Log(Log {
             log: "authed stress test log".into(),
             blob: vec![],
         }),
@@ -844,7 +774,7 @@ async fn main() {
         "authed_Err",
         &auth_token,
         &assigned_uuid,
-        Payload::Err(Err {
+        EnginePayload::Err(Err {
             log: "authed stress test error".into(),
             blob: vec![],
             trace: "test stack trace".into(),
@@ -855,33 +785,10 @@ async fn main() {
     test_authed_send(
         &mut results,
         &config,
-        "authed_TimelineEvent",
-        &auth_token,
-        &assigned_uuid,
-        Payload::TimelineEvent(TimelineEvent {
-            timeline_id_uuid7: uuid::Uuid::now_v7().to_string(),
-            event_type: EventCategory::UserMessage as i32,
-            command_flag: "".into(),
-            data_blob: b"test data".to_vec(),
-            error_message: "".into(),
-            raw_flags: "".into(),
-            message_origin: "stress-test".into(),
-            stream_origin: "test-stream".into(),
-            raw_message: "raw".into(),
-            processed_message: "processed".into(),
-            user_uuid7: "user-1".into(),
-            version: 1,
-        }),
-    )
-    .await;
-
-    test_authed_send(
-        &mut results,
-        &config,
         "authed_MessagePreProcess",
         &auth_token,
         &assigned_uuid,
-        Payload::MessagePreProcess(MessagePreProcess {
+        EnginePayload::MessagePreProcess(MessagePreProcess {
             message_uuid7: String::new(),
             raw_message: Some(dummy_chat_message()),
             audio: vec![],
@@ -896,7 +803,7 @@ async fn main() {
         "authed_MessageInProcess",
         &auth_token,
         &assigned_uuid,
-        Payload::MessageInProcess(MessageInProcess {
+        EnginePayload::MessageInProcess(MessageInProcess {
             message_uuid7: String::new(),
             raw_message: Some(dummy_chat_message()),
             processed_message: "in-processed".into(),
@@ -913,7 +820,7 @@ async fn main() {
         "authed_MessagePostProcess",
         &auth_token,
         &assigned_uuid,
-        Payload::MessagePostProcess(MessagePostProcess {
+        EnginePayload::MessagePostProcess(MessagePostProcess {
             message_uuid7: String::new(),
             raw_message: Some(dummy_chat_message()),
             processed_message: "post-processed".into(),
@@ -929,7 +836,7 @@ async fn main() {
         "authed_Commands",
         &auth_token,
         &assigned_uuid,
-        Payload::CommandsPayload(Commands {
+        EnginePayload::Commands(Commands {
             alert_on_unknown_command: false,
             commands: vec![Command {
                 command_name: "test_cmd".into(),
@@ -958,7 +865,7 @@ async fn main() {
         // Note: the engine now requires the actor to be a DB-verified moderator,
         // so a bare authed SendToPlatforms may be rejected unless the actor
         // resolves to a verified moderator in the user database.
-        Payload::SendToPlatforms(SendToPlatforms {
+        EnginePayload::SendToPlatforms(SendToPlatforms {
             msg: "Hello from stress test!".into(),
             level: PlatformSendLevel::All as i32,
             module_uuid7: assigned_uuid.clone(),
@@ -975,34 +882,10 @@ async fn main() {
     test_authed_send(
         &mut results,
         &config,
-        "authed_Shutdown",
-        &auth_token,
-        &assigned_uuid,
-        Payload::Shutdown(Shutdown {
-            reason: "test shutdown from stress test".into(),
-        }),
-    )
-    .await;
-
-    test_authed_send(
-        &mut results,
-        &config,
-        "authed_AuthNew",
-        &auth_token,
-        &assigned_uuid,
-        Payload::AuthNew(AuthNew {
-            new_auth: "new-token-test".into(),
-        }),
-    )
-    .await;
-
-    test_authed_send(
-        &mut results,
-        &config,
         "authed_AuthVerify",
         &auth_token,
         &assigned_uuid,
-        Payload::AuthVerify(AuthVerify {
+        EnginePayload::AuthVerify(AuthVerify {
             cur_auth: auth_token.clone(),
         }),
     )
@@ -1014,34 +897,11 @@ async fn main() {
         "authed_ConnectionRequest",
         &auth_token,
         &assigned_uuid,
-        Payload::ConnectionRequest(ConnectionRequest {
+        EnginePayload::ConnectionRequest(ConnectionRequest {
             pin: cli_pin(),
             process_position: ProcessPosition::Connection as i32,
             priority: 200,
             module_instance_uuid7: assigned_uuid.clone(),
-        }),
-    )
-    .await;
-
-    test_authed_send(
-        &mut results,
-        &config,
-        "authed_UserData",
-        &auth_token,
-        &assigned_uuid,
-        Payload::UserData(UserData {
-            uuid: "test-user".into(),
-            username: "tester".into(),
-            is_sponsor: false,
-            is_moderator: false,
-            is_admin: false,
-            is_owner: false,
-            bans: vec![],
-            commendations: vec![],
-            styling: Some(UserStylingTemplate {
-                css_properties: Default::default(),
-            }),
-            platform_ids: Default::default(),
         }),
     )
     .await;
