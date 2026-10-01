@@ -8,20 +8,20 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct Config {
     /// How long to wait for the engine to sever an unauthenticated connection.
-    pub sever_wait_ms: u64,
+    pub sever_wait_ms: u32,
     /// How long to wait for the invalid-PIN auth reply.
-    pub invalid_pin_reply_ms: u64,
+    pub invalid_pin_reply_ms: u32,
     /// How long to wait for the valid-PIN auth reply.
-    pub valid_pin_reply_ms: u64,
+    pub valid_pin_reply_ms: u32,
     /// How long to wait for any engine keepalive before treating a reconnect
     /// as alive.
-    pub keepalive_probe_ms: u64,
+    pub keepalive_probe_ms: u32,
     /// Pause after the reconnect handshake before the test sends.
-    pub post_reconnect_settle_ms: u64,
+    pub post_reconnect_settle_ms: u32,
     /// How long to drain the socket for stray frames before the test send.
-    pub pre_test_drain_ms: u64,
+    pub pre_test_drain_ms: u32,
     /// How long to wait after the test send to confirm the connection is alive.
-    pub post_send_alive_check_ms: u64,
+    pub post_send_alive_check_ms: u32,
 }
 
 impl Default for Config {

@@ -124,8 +124,8 @@ async fn send_container(ws: &mut WsStream, container: ContainerForEngine) -> Res
         .map_err(|e| format!("Send error: {}", e))
 }
 
-async fn receive_container(ws: &mut WsStream, timeout_ms: u64) -> Result<ContainerForModule, String> {
-    let result = tokio::time::timeout(Duration::from_millis(timeout_ms), ws.next()).await;
+async fn receive_container(ws: &mut WsStream, timeout_ms: u32) -> Result<ContainerForModule, String> {
+    let result = tokio::time::timeout(Duration::from_millis(timeout_ms as u64), ws.next()).await;
     match result {
         Ok(Some(Ok(WsMessage::Binary(data)))) => {
             ContainerForModule::decode(data.as_ref()).map_err(|e| format!("Decode error: {}", e))
@@ -139,8 +139,8 @@ async fn receive_container(ws: &mut WsStream, timeout_ms: u64) -> Result<Contain
 }
 
 /// Wait for connection to be severed (either close frame or stream end)
-async fn wait_for_sever(ws: &mut WsStream, timeout_ms: u64) -> bool {
-    let result = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
+async fn wait_for_sever(ws: &mut WsStream, timeout_ms: u32) -> bool {
+    let result = tokio::time::timeout(Duration::from_millis(timeout_ms as u64), async {
         while let Some(msg) = ws.next().await {
             match msg {
                 Ok(WsMessage::Close(_)) | Ok(WsMessage::Frame(_)) => return true,
@@ -363,7 +363,7 @@ async fn test_reconnect_with_token(
     // response on reconnect, so a timeout (or an unexpected message) means the
     // session is authenticated and alive; a close/stream-end means it was
     // severed.
-    let result = tokio::time::timeout(Duration::from_millis(config.keepalive_probe_ms), ws.next()).await;
+    let result = tokio::time::timeout(Duration::from_millis(config.keepalive_probe_ms as u64), ws.next()).await;
     match result {
         Ok(None) => {
             results.fail("reconnect_with_token", "Connection closed (reconnect rejected)");
@@ -459,10 +459,10 @@ async fn test_authed_send(
     }
 
     // Wait for auth to be processed
-    sleep(Duration::from_millis(config.post_reconnect_settle_ms)).await;
+    sleep(Duration::from_millis(config.post_reconnect_settle_ms as u64)).await;
 
     // Drain any messages the engine may have sent
-    let result = tokio::time::timeout(Duration::from_millis(config.pre_test_drain_ms), ws.next()).await;
+    let result = tokio::time::timeout(Duration::from_millis(config.pre_test_drain_ms as u64), ws.next()).await;
     if let Ok(Some(Ok(WsMessage::Close(_)))) = result {
         results.fail(name, "Connection severed during drain");
         return;
@@ -476,7 +476,7 @@ async fn test_authed_send(
     }
 
     // Check connection is still alive
-    let result = tokio::time::timeout(Duration::from_millis(config.post_send_alive_check_ms), ws.next()).await;
+    let result = tokio::time::timeout(Duration::from_millis(config.post_send_alive_check_ms as u64), ws.next()).await;
     match result {
         Ok(Some(Ok(WsMessage::Close(_)))) => {
             results.fail(name, "Connection severed after send (auth may have failed)");
